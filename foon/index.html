@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>New Super Mario Bros. Wii</title>
+<!-- same isolation trick as index.html: the service worker adds COOP/COEP and reloads once -->
+<script src="coi.js"></script>
+<style>
+  html,body{margin:0;height:100%;background:#0a0f1a;color:#cfe3ff;font:14px/1.5 system-ui,Segoe UI,sans-serif;overflow:hidden}
+  #box{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center}
+  h1{margin:0;font-size:18px;font-weight:600;letter-spacing:.02em;color:#fff}
+  #track{width:min(460px,80vw);height:6px;border-radius:3px;background:#182437;overflow:hidden}
+  #bar{height:100%;width:0;background:linear-gradient(90deg,#3ba0ff,#7ee0ff);transition:width .12s linear}
+  #txt{margin:0;opacity:.75;max-width:min(620px,86vw)}
+  #err{color:#ff9a9a;display:none;white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px;max-width:min(760px,90vw)}
+</style>
+</head>
+<body>
+<div id="box">
+  <h1>New Super Mario Bros. Wii</h1>
+  <div id="track"><div id="bar"></div></div>
+  <p id="txt">Starting…</p>
+  <p id="err"></p>
+</div>
+<script>
+// Collects the split game page and hands this document over to it. No iframe: the assembled page
+// replaces the loader in the same tab.
+(function () {
+  'use strict';
+  var DIR = 'full/';                 // where the .bin parts and manifest.json live
+  var PARALLEL = 4;
+  var txt = document.getElementById('txt'), bar = document.getElementById('bar'), errEl = document.getElementById('err');
+  function fail(e) {
+    var m = (e && e.message) || String(e);
+    errEl.style.display = 'block';
+    errEl.textContent = 'Could not load the game parts: ' + m + '\n' +
+      (location.protocol === 'file:' ? 'Open this page through a web server (iniciar-nsmbw.bat or serve.py): a file:// page cannot read the parts.' : 'Check that ' + DIR + ' is next to this page and served by the same host.');
+    console.error('[loader]', m);
+  }
+  function step(done, count) {
+    var pct = Math.round(done / count * 100);
+    bar.style.width = pct + '%';
+    txt.textContent = 'Assembling the game… ' + pct + '%  (' + done + '/' + count + ' parts)';
+  }
+  (async function () {
+    if (!window.fetch) return fail(new Error('this browser has no fetch'));
+    var resp = await fetch(DIR + 'manifest.json', { cache: 'no-cache' });
+    if (!resp.ok) return fail(new Error(DIR + 'manifest.json: HTTP ' + resp.status));
+    var man = await resp.json();
+    if (!man || !man.count || !man.files || !man.total) return fail(new Error('manifest.json is not a part list'));
+    var parts = new Array(man.count), done = 0, next = 0, failure = null;
+    async function worker() {
+      while (true) {
+        var i = next++;
+        if (i >= man.count || failure) return;
+        try {
+          var r = await fetch(DIR + man.files[i], { cache: 'force-cache' });
+          if (!r.ok) throw new Error(man.files[i] + ': HTTP ' + r.status);
+          var ab = await r.arrayBuffer();
+          if (ab.byteLength !== (i === man.count - 1 ? man.total - i * man.chunkSize : man.chunkSize)) {
+            throw new Error(man.files[i] + ': ' + ab.byteLength + ' bytes, expected ' +
+              (i === man.count - 1 ? man.total - i * man.chunkSize : man.chunkSize));
+          }
+          parts[i] = ab; step(++done, man.count);
+        } catch (e) { failure = e; return; }
+      }
+    }
+    var lanes = [];
+    for (var k = 0; k < Math.min(PARALLEL, man.count); k++) lanes.push(worker());
+    await Promise.all(lanes);
+    if (failure) return fail(failure);
+    var total = 0;
+    for (var i = 0; i < parts.length; i++) total += parts[i].byteLength;
+    if (total !== man.total) return fail(new Error('assembled ' + total + ' bytes, expected ' + man.total));
+    // The page is a windows-1252 document holding raw bytes, so decode it with the same encoding and
+    // write the characters straight into this document: one char per byte, nothing re-encoded.
+    txt.textContent = 'Starting…';
+    var dec = new TextDecoder('windows-1252'), texts = [], chars = 0, i;
+    for (i = 0; i < parts.length; i++) {
+      texts.push(dec.decode(parts[i], { stream: true }));
+      chars += texts[texts.length - 1].length;
+      parts[i] = null;
+    }
+    texts.push(dec.decode());
+    chars += texts[texts.length - 1].length;
+    if (chars !== total) return fail(new Error('decoded ' + chars + ' characters from ' + total + ' bytes'));
+    console.log('[loader] assembled ' + total + ' bytes into one page, taking over this tab');
+    try {
+      document.open();                        // this document becomes the game, no iframe
+      for (i = 0; i < texts.length; i++) document.write(texts[i]);
+      document.close();
+    } catch (e) { fail(e); }
+  })().catch(fail);
+})();
+</script>
+</body>
+</html>
