@@ -6,6 +6,79 @@
 <title>New Super Mario Bros. Wii</title>
 <!-- same isolation trick as index.html: the service worker adds COOP/COEP and reloads once -->
 <script src="coi.js"></script>
+<!-- document.open() below throws this document away, so the range patcher is carried in this
+     inert block and written into the assembled page by injectPatch(). -->
+<script type="text/plain" id="range-patch">
+(function () {
+  'use strict';
+  if (window.__rangePatchInstalled) return;
+  window.__rangePatchInstalled = true;
+  var MAX_BUFFER = 64 * 1024 * 1024;   // hosts answering a slice with a bigger body are left alone
+
+  function parseRange(header, size) {
+    var m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
+    if (!m || (m[1] === '' && m[2] === '')) return null;
+    if (!size) return null;
+    var start, end;
+    if (m[1] === '') {
+      var suffix = Number(m[2]);
+      if (!(suffix > 0)) return null;
+      start = Math.max(0, size - suffix);
+      end = size - 1;
+    } else {
+      start = Number(m[1]);
+      end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+      if (start >= size || end < start) return null;
+    }
+    return { start: start, end: end };
+  }
+
+  function slice(buffer, spec, type, size) {
+    var chunk = buffer.slice(spec.start, spec.end + 1);
+    return new Response(chunk, {
+      status: 206,
+      statusText: 'Partial Content',
+      headers: {
+        'Content-Type': type || 'application/octet-stream',
+        'Content-Length': String(chunk.byteLength),
+        'Content-Range': 'bytes ' + spec.start + '-' + spec.end + '/' + size,
+        'Accept-Ranges': 'bytes'
+      }
+    });
+  }
+
+  // A host that ignores Range answers with 200 and the whole file; the game asks for 256 KiB
+  // blocks and stops when it gets a multi-megabyte body back. Slice it here instead.
+  var nativeFetch = window.fetch;
+  if (nativeFetch) {
+    window.fetch = function (input, init) {
+      var request;
+      try { request = new Request(input, init); } catch (e) { return nativeFetch.call(window, input, init); }
+      var range = request.headers.get('Range');
+      if (!range || request.method !== 'GET') return nativeFetch.call(window, request);
+      return nativeFetch.call(window, request).then(function (response) {
+        if (response.status !== 200 || response.type === 'opaque') return response;   // 206: already sliced
+        var declared = Number(response.headers.get('Content-Length'));
+        if (declared > MAX_BUFFER) return response;
+        return response.arrayBuffer().then(function (buffer) {
+          var spec = parseRange(range, buffer.byteLength);
+          if (!spec) return new Response(buffer, { status: 200, headers: response.headers });
+          return slice(buffer, spec, response.headers.get('Content-Type'), buffer.byteLength);
+        });
+      });
+    };
+  }
+
+  // The game's own reads are synchronous XHR from a worker, which only a service worker can
+  // rewrite; register it here, before the game's scripts, so a replaced DOM keeps it.
+  if ('serviceWorker' in navigator &&
+      (location.protocol === 'https:' || /^(localhost|127\.0\.0\.1)$/.test(location.hostname))) {
+    navigator.serviceWorker.register('./coi-sw.js', { scope: './', updateViaCache: 'none' })
+      .catch(function (error) { console.warn('[range-patch] service worker unavailable:', error && error.message); });
+  }
+  console.log('[range-patch] installed in the replaced document');
+})();
+</script>
 <style>
   html,body{margin:0;height:100%;background:#0a0f1a;color:#cfe3ff;font:14px/1.5 system-ui,Segoe UI,sans-serif;overflow:hidden}
   #box{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center}
@@ -30,7 +103,19 @@
   'use strict';
   var DIR = 'full/';                 // where the .bin parts and manifest.json live
   var PARALLEL = 4;
+  // Captured now: document.open() below throws this document away, inert block included.
+  var patchSrc = (document.getElementById('range-patch') || {}).textContent || '';
   var txt = document.getElementById('txt'), bar = document.getElementById('bar'), errEl = document.getElementById('err');
+  // Put the range patcher first inside the assembled page's <head> so it installs before any
+  // game script runs and survives the replacement of this document.
+  function injectPatch(text, source) {
+    var tag = '<script data-range-patch>' + source + '<\/script>';
+    var head = /<head\b[^>]*>/i.exec(text);
+    if (head) return text.slice(0, head.index + head[0].length) + tag + text.slice(head.index + head[0].length);
+    var html = /<html\b[^>]*>/i.exec(text);
+    if (html) return text.slice(0, html.index + html[0].length) + tag + text.slice(html.index + html[0].length);
+    return tag + text;
+  }
   function fail(e) {
     var m = (e && e.message) || String(e);
     errEl.style.display = 'block';
@@ -85,6 +170,7 @@
     texts.push(dec.decode());
     chars += texts[texts.length - 1].length;
     if (chars !== total) return fail(new Error('decoded ' + chars + ' characters from ' + total + ' bytes'));
+    if (patchSrc) texts[0] = injectPatch(texts[0], patchSrc);
     console.log('[loader] assembled ' + total + ' bytes into one page, taking over this tab');
     try {
       document.open();                        // this document becomes the game, no iframe
